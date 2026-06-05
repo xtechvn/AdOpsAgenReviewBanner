@@ -1,11 +1,11 @@
 using AdOpsAgenReviewBanner.Application;
-using Xunit;
 using AdOpsAgenReviewBanner.Application.Abstractions;
 using AdOpsAgenReviewBanner.Application.Queue;
 using AdOpsAgenReviewBanner.Configuration;
 using AdOpsAgenReviewBanner.Domain;
 using AdOpsAgenReviewBanner.Domain.Models;
 using AdOpsAgenReviewBanner.Domain.Services;
+using Xunit;
 
 namespace AdOpsAgenReviewBanner.Tests;
 
@@ -14,7 +14,7 @@ public class ReviewQueueMessageProcessorTests
     [Fact]
     public async Task ProcessAsync_ModeMismatch_ReturnsSkipped()
     {
-        var processor = CreateProcessor(WorkerMode.Reviewed, new FakeLinkImageFetcher("C:\\temp\\banner.png"));
+        var processor = CreateProcessor(WorkerMode.Reviewed);
 
         var result = await processor.ProcessAsync(new ReviewQueueMessage
         {
@@ -28,7 +28,7 @@ public class ReviewQueueMessageProcessorTests
     [Fact]
     public async Task ProcessAsync_InvalidMode_ReturnsInvalidMessage()
     {
-        var processor = CreateProcessor(WorkerMode.Reviewed, new FakeLinkImageFetcher("C:\\temp\\banner.png"));
+        var processor = CreateProcessor(WorkerMode.Reviewed);
 
         var result = await processor.ProcessAsync(new ReviewQueueMessage
         {
@@ -40,9 +40,25 @@ public class ReviewQueueMessageProcessorTests
     }
 
     [Fact]
-    public async Task ProcessAsync_MatchingMode_ProcessesMessage()
+    public async Task ProcessAsync_ReviewedMode_UsesGamWorkflow()
     {
-        var processor = CreateProcessor(WorkerMode.Blocked, new FakeLinkImageFetcher("C:\\temp\\banner.png"));
+        var workflow = new FakeGamWorkflow();
+        var processor = CreateProcessor(WorkerMode.Reviewed, workflow);
+
+        var result = await processor.ProcessAsync(new ReviewQueueMessage
+        {
+            LinkReview = "https://admanager.google.com/27973503#creatives/ad_review_center",
+            Mode = "reviewed"
+        });
+
+        Assert.Equal(QueueProcessResult.Processed, result);
+        Assert.Equal(1, workflow.CallCount);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_BlockedMode_UsesLinkFetcher()
+    {
+        var processor = CreateProcessor(WorkerMode.Blocked);
 
         var result = await processor.ProcessAsync(new ReviewQueueMessage
         {
@@ -55,7 +71,7 @@ public class ReviewQueueMessageProcessorTests
 
     private static ReviewQueueMessageProcessor CreateProcessor(
         WorkerMode workerMode,
-        ILinkImageFetcher linkImageFetcher)
+        IGamAdReviewWorkflow? gamWorkflow = null)
     {
         var useCase = new ReviewBannerUseCase(
             new FakePolicyProvider(),
@@ -65,7 +81,24 @@ public class ReviewQueueMessageProcessorTests
             new VerdictParser(),
             new FakeTelegramNotifier());
 
-        return new ReviewQueueMessageProcessor(linkImageFetcher, useCase, workerMode);
+        return new ReviewQueueMessageProcessor(
+            gamWorkflow ?? new FakeGamWorkflow(),
+            new FakeLinkImageFetcher("C:\\temp\\banner.png"),
+            useCase,
+            workerMode);
+    }
+
+    private sealed class FakeGamWorkflow : IGamAdReviewWorkflow
+    {
+        public int CallCount { get; private set; }
+
+        public Task<GamReviewWorkflowResult> ProcessReviewListAsync(
+            string listUrl,
+            CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            return Task.FromResult(new GamReviewWorkflowResult { ProcessedCount = 1 });
+        }
     }
 
     private sealed class FakeLinkImageFetcher(string path) : ILinkImageFetcher

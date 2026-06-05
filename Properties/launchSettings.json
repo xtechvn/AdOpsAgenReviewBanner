@@ -2,15 +2,24 @@
   "profiles": {
     "TEST - Quét folder image_test": {
       "commandName": "Project",
-      "commandLineArgs": ""
+      "commandLineArgs": "",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Development"
+      }
     },
     "TEST - 1 file ảnh": {
       "commandName": "Project",
-      "commandLineArgs": "image_test\\Screenshot_3.png"
+      "commandLineArgs": "image_test\\Screenshot_3.png",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Development"
+      }
     },
     "TEST - Link GAM (Selenium)": {
       "commandName": "Project",
-      "commandLineArgs": "https://admanager.google.com/"
+      "commandLineArgs": "https://admanager.google.com/",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Development"
+      }
     },
     "PRODUCTION - RabbitMQ Reviewed": {
       "commandName": "Project",

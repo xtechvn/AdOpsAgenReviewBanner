@@ -13,7 +13,7 @@ public sealed class MongoSettings
     public string Database { get; set; } = "news_fptonline";
 
     /// <summary>Collection lưu log kết quả review banner (link, mode, verdict, thời gian).</summary>
-    public string CollectionBannerReview { get; set; } = "banner_review_log";
+    public string CollectionBannerReview { get; set; } = "BannerDfpScreenShot";
 
     /// <summary>Bật ghi Mongo sau mỗi lần review. false = chỉ dùng Telegram/console.</summary>
     public bool Enabled { get; set; } = false;

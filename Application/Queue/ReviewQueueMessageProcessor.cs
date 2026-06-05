@@ -5,8 +5,9 @@ using ReviewBannerUseCase = AdOpsAgenReviewBanner.Application.ReviewBannerUseCas
 namespace AdOpsAgenReviewBanner.Application.Queue;
 
 /// <summary>
-/// Xử lý 1 message queue (hoặc TEST với URL):
-/// validate mode → Selenium lấy ảnh → ReviewBannerUseCase → xóa file tạm.
+/// Xử lý message queue:
+/// - Reviewed: mở link_review (danh sách GAM) → duyệt toàn bộ banner → Gemini → Mongo.
+/// - Blocked: (tạm) luồng cũ link đơn — sẽ bổ sung sau.
 /// </summary>
 
 public enum QueueProcessResult
@@ -19,15 +20,18 @@ public enum QueueProcessResult
 
 public sealed class ReviewQueueMessageProcessor
 {
+    private readonly IGamAdReviewWorkflow _gamWorkflow;
     private readonly ILinkImageFetcher _linkImageFetcher;
     private readonly ReviewBannerUseCase _useCase;
     private readonly WorkerMode _workerMode;
 
     public ReviewQueueMessageProcessor(
+        IGamAdReviewWorkflow gamWorkflow,
         ILinkImageFetcher linkImageFetcher,
         ReviewBannerUseCase useCase,
         WorkerMode workerMode)
     {
+        _gamWorkflow = gamWorkflow;
         _linkImageFetcher = linkImageFetcher;
         _useCase = useCase;
         _workerMode = workerMode;
@@ -46,6 +50,15 @@ public sealed class ReviewQueueMessageProcessor
         if (messageMode != _workerMode)
             return QueueProcessResult.SkippedModeMismatch;
 
+        if (messageMode == WorkerMode.Reviewed)
+        {
+            var result = await _gamWorkflow.ProcessReviewListAsync(message.LinkReview, cancellationToken);
+            Console.WriteLine(
+                $"GAM workflow done: processed={result.ProcessedCount}, reviewed={result.ReviewedCount}, skipped={result.SkippedExistingCount}, errors={result.ErrorCount}");
+            return QueueProcessResult.Processed;
+        }
+
+        // Blocked mode — giữ luồng đơn tạm thời
         var tempImagePath = await _linkImageFetcher.FetchToLocalPathAsync(message.LinkReview, cancellationToken);
         if (string.IsNullOrWhiteSpace(tempImagePath))
             return QueueProcessResult.FetchImageFailed;

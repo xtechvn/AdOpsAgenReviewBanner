@@ -7,6 +7,7 @@ using AdOpsAgenReviewBanner.Infrastructure.Configuration;
 using AdOpsAgenReviewBanner.Infrastructure.Files;
 using AdOpsAgenReviewBanner.Infrastructure.Gemini;
 using AdOpsAgenReviewBanner.Infrastructure.Messaging;
+using AdOpsAgenReviewBanner.Infrastructure.Mongo;
 using AdOpsAgenReviewBanner.Infrastructure.Prompting;
 using AdOpsAgenReviewBanner.Infrastructure.Selenium;
 using AdOpsAgenReviewBanner.Infrastructure.Telegram;
@@ -44,6 +45,9 @@ public static class ServiceCollectionExtensions
         services.AddOptions<MongoSettings>()
             .BindConfiguration("Mongo");
 
+        services.AddOptions<GamReviewSettings>()
+            .BindConfiguration("GamReview");
+
         services.AddHttpClient<ITelegramNotifier, TelegramNotifier>();
 
         // --- Domain / Application: lõi review 1 ảnh ---
@@ -62,10 +66,13 @@ public static class ServiceCollectionExtensions
         // --- Queue / Selenium: dùng khi có link_review (Production hoặc TEST URL) ---
         services.AddSingleton<ChromeDriverFactory>();
         services.AddSingleton<ILinkImageFetcher, SeleniumLinkImageFetcher>();
+        services.AddSingleton<IBannerReviewRepository, MongoBannerReviewRepository>();
+        services.AddSingleton<IGamAdReviewWorkflow, GamAdReviewCenterWorkflow>();
         services.AddScoped<ReviewQueueMessageProcessor>(sp =>
         {
             var runtime = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<RuntimeSettings>>().Value;
             return new ReviewQueueMessageProcessor(
+                sp.GetRequiredService<IGamAdReviewWorkflow>(),
                 sp.GetRequiredService<ILinkImageFetcher>(),
                 sp.GetRequiredService<ReviewBannerUseCase>(),
                 runtime.WorkerMode); // strict-filter: chỉ xử lý message cùng mode

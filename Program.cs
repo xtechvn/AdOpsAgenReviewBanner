@@ -137,7 +137,6 @@ static bool IsHttpUrl(string value) =>
 static async Task<int> RunTestLinkReviewAsync(IHost host, string linkReview, WorkerMode workerMode)
 {
     using var scope = host.Services.CreateScope();
-    var processor = scope.ServiceProvider.GetRequiredService<ReviewQueueMessageProcessor>();
 
     var message = new ReviewQueueMessage
     {
@@ -146,6 +145,17 @@ static async Task<int> RunTestLinkReviewAsync(IHost host, string linkReview, Wor
     };
 
     Console.WriteLine($"TEST link review: {linkReview}, mode={message.Mode}");
+
+    if (workerMode == WorkerMode.Reviewed)
+    {
+        var workflow = scope.ServiceProvider.GetRequiredService<IGamAdReviewWorkflow>();
+        var gamResult = await workflow.ProcessReviewListAsync(linkReview);
+        Console.WriteLine(
+            $"GAM workflow: processed={gamResult.ProcessedCount}, reviewed={gamResult.ReviewedCount}, skipped={gamResult.SkippedExistingCount}, errors={gamResult.ErrorCount}");
+        return gamResult.ErrorCount == 0 ? 0 : 1;
+    }
+
+    var processor = scope.ServiceProvider.GetRequiredService<ReviewQueueMessageProcessor>();
     var result = await processor.ProcessAsync(message);
 
     return result switch
