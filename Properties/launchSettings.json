@@ -1,0 +1,31 @@
+{
+  "profiles": {
+    "TEST - Quét folder image_test": {
+      "commandName": "Project",
+      "commandLineArgs": ""
+    },
+    "TEST - 1 file ảnh": {
+      "commandName": "Project",
+      "commandLineArgs": "image_test\\Screenshot_3.png"
+    },
+    "TEST - Link GAM (Selenium)": {
+      "commandName": "Project",
+      "commandLineArgs": "https://admanager.google.com/"
+    },
+    "PRODUCTION - RabbitMQ Reviewed": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Production"
+      }
+    },
+    "PRODUCTION - RabbitMQ Blocked": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "ProductionBlocked"
+      }
+    },
+    "Container (Dockerfile)": {
+      "commandName": "Docker"
+    }
+  }
+}
