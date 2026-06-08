@@ -29,7 +29,8 @@ public sealed class ChromeDriverFactory
             try
             {
                 Console.WriteLine(
-                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} Chrome session attempt {attempt + 1}/{maxRetries} (profile: {primaryProfile})");
+                    $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} Chrome session attempt {attempt + 1}/{maxRetries} " +
+                    $"(Headless={_settings.Headless}, profile: {primaryProfile})");
                 return CreateDriver(primaryProfile);
             }
             catch (Exception ex)

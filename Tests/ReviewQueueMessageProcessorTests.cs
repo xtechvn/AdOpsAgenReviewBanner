@@ -1,10 +1,7 @@
-using AdOpsAgenReviewBanner.Application;
 using AdOpsAgenReviewBanner.Application.Abstractions;
 using AdOpsAgenReviewBanner.Application.Queue;
 using AdOpsAgenReviewBanner.Configuration;
-using AdOpsAgenReviewBanner.Domain;
 using AdOpsAgenReviewBanner.Domain.Models;
-using AdOpsAgenReviewBanner.Domain.Services;
 using Xunit;
 
 namespace AdOpsAgenReviewBanner.Tests;
@@ -19,7 +16,9 @@ public class ReviewQueueMessageProcessorTests
         var result = await processor.ProcessAsync(new ReviewQueueMessage
         {
             LinkReview = "https://example.com",
-            Mode = "blocked"
+            Mode = "execute_plan",
+            CreativeId = "AJILAYtest",
+            Action = "Blocked"
         });
 
         Assert.Equal(QueueProcessResult.SkippedModeMismatch, result);
@@ -48,93 +47,195 @@ public class ReviewQueueMessageProcessorTests
         var result = await processor.ProcessAsync(new ReviewQueueMessage
         {
             LinkReview = "https://admanager.google.com/27973503#creatives/ad_review_center",
-            Mode = "reviewed"
+            Mode = "reviewed",
+            Order = 3,
+            Category = "Autos & Vehicles"
         });
 
         Assert.Equal(QueueProcessResult.Processed, result);
         Assert.Equal(1, workflow.CallCount);
+        Assert.Equal(3, workflow.LastCategoryOrder);
+        Assert.Equal("Autos & Vehicles", workflow.LastCategoryName);
     }
 
     [Fact]
-    public async Task ProcessAsync_BlockedMode_UsesLinkFetcher()
+    public async Task ProcessAsync_ReviewedMode_MissingLink_ReturnsInvalid()
     {
-        var processor = CreateProcessor(WorkerMode.Blocked);
+        var processor = CreateProcessor(WorkerMode.Reviewed);
+
+        var result = await processor.ProcessAsync(new ReviewQueueMessage
+        {
+            Mode = "reviewed",
+            Order = 1
+        });
+
+        Assert.Equal(QueueProcessResult.InvalidMessage, result);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_ReviewedMode_MissingOrder_ReturnsInvalid()
+    {
+        var processor = CreateProcessor(WorkerMode.Reviewed);
 
         var result = await processor.ProcessAsync(new ReviewQueueMessage
         {
             LinkReview = "https://example.com",
-            Mode = "blocked"
+            Mode = "reviewed"
+        });
+
+        Assert.Equal(QueueProcessResult.InvalidMessage, result);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_ExecutePlanMode_UsesBlockedWorkflow_AndMarksReviewed()
+    {
+        var blocked = new FakeBlockedWorkflow { Success = true };
+        var repository = new FakeBannerReviewRepository();
+        var processor = CreateProcessor(WorkerMode.ExecutePlan, blockedWorkflow: blocked, repository: repository);
+
+        var result = await processor.ProcessAsync(new ReviewQueueMessage
+        {
+            CreativeId = "AJILAYpjouwEOlCWOS8HSQtTqEbOy4K5hw82N6pXjopruZWkouzCSlWv",
+            Action = "Blocked",
+            Mode = "execute_plan"
         });
 
         Assert.Equal(QueueProcessResult.Processed, result);
+        Assert.Equal(1, blocked.CallCount);
+        Assert.Equal(GamModerationAction.Block, blocked.LastAction);
+        Assert.Contains("AJILAYpjouwEOlCWOS8HSQtTqEbOy4K5hw82N6pXjopruZWkouzCSlWv", repository.MarkedReviewedIds);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_ExecutePlanMode_AllowAction_MapsToAllow()
+    {
+        var blocked = new FakeBlockedWorkflow { Success = true };
+        var processor = CreateProcessor(WorkerMode.ExecutePlan, blockedWorkflow: blocked);
+
+        await processor.ProcessAsync(new ReviewQueueMessage
+        {
+            CreativeId = "AJILAYtest",
+            Action = "Reviewed",
+            Mode = "execute_plan"
+        });
+
+        Assert.Equal(GamModerationAction.Allow, blocked.LastAction);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_ExecutePlanMode_MissingCreativeId_ReturnsInvalid()
+    {
+        var processor = CreateProcessor(WorkerMode.ExecutePlan);
+
+        var result = await processor.ProcessAsync(new ReviewQueueMessage
+        {
+            Action = "Blocked",
+            Mode = "execute_plan"
+        });
+
+        Assert.Equal(QueueProcessResult.InvalidMessage, result);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_ExecutePlanMode_WorkflowFails_ReturnsBlockedActionFailed()
+    {
+        var blocked = new FakeBlockedWorkflow { Success = false };
+        var processor = CreateProcessor(WorkerMode.ExecutePlan, blockedWorkflow: blocked);
+
+        var result = await processor.ProcessAsync(new ReviewQueueMessage
+        {
+            CreativeId = "AJILAYtest",
+            Action = "Blocked",
+            Mode = "execute_plan"
+        });
+
+        Assert.Equal(QueueProcessResult.BlockedActionFailed, result);
     }
 
     private static ReviewQueueMessageProcessor CreateProcessor(
         WorkerMode workerMode,
-        IGamAdReviewWorkflow? gamWorkflow = null)
-    {
-        var useCase = new ReviewBannerUseCase(
-            new FakePolicyProvider(),
-            new FakeImageReader(),
-            new FakePromptBuilder(),
-            new FakeVisionAnalyzer(),
-            new VerdictParser(),
-            new FakeTelegramNotifier());
-
-        return new ReviewQueueMessageProcessor(
-            gamWorkflow ?? new FakeGamWorkflow(),
-            new FakeLinkImageFetcher("C:\\temp\\banner.png"),
-            useCase,
+        IGamAdReviewWorkflow? gamWorkflow = null,
+        IGamBlockedActionWorkflow? blockedWorkflow = null,
+        IBannerReviewRepository? repository = null) =>
+        new(
+            workerMode == WorkerMode.Reviewed
+                ? gamWorkflow ?? new FakeGamWorkflow()
+                : null,
+            workerMode == WorkerMode.ExecutePlan
+                ? blockedWorkflow ?? new FakeBlockedWorkflow { Success = true }
+                : null,
+            repository ?? new FakeBannerReviewRepository(),
             workerMode);
-    }
 
     private sealed class FakeGamWorkflow : IGamAdReviewWorkflow
     {
         public int CallCount { get; private set; }
+        public int LastCategoryOrder { get; private set; }
+        public string? LastCategoryName { get; private set; }
 
         public Task<GamReviewWorkflowResult> ProcessReviewListAsync(
             string listUrl,
+            int categoryOrder,
+            string? categoryName = null,
             CancellationToken cancellationToken = default)
         {
             CallCount++;
+            LastCategoryOrder = categoryOrder;
+            LastCategoryName = categoryName;
             return Task.FromResult(new GamReviewWorkflowResult { ProcessedCount = 1 });
         }
     }
 
-    private sealed class FakeLinkImageFetcher(string path) : ILinkImageFetcher
+    private sealed class FakeBlockedWorkflow : IGamBlockedActionWorkflow
     {
-        public Task<string?> FetchToLocalPathAsync(string linkReview, CancellationToken cancellationToken = default)
-            => Task.FromResult<string?>(path);
+        public bool Success { get; init; } = true;
+        public int CallCount { get; private set; }
+        public GamModerationAction LastAction { get; private set; }
+
+        public Task<GamBlockedActionResult> ApplyActionAsync(
+            string creativeId,
+            GamModerationAction action,
+            string? linkReview = null,
+            CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            LastAction = action;
+            return Task.FromResult(new GamBlockedActionResult
+            {
+                Success = Success,
+                CreativeId = creativeId,
+                ActionLabel = action == GamModerationAction.Block ? "Blocked" : "Reviewed",
+                ErrorMessage = Success ? null : "selenium error"
+            });
+        }
     }
 
-    private sealed class FakeImageReader : IImageReader
+    private sealed class FakeBannerReviewRepository : IBannerReviewRepository
     {
-        public Task<BannerImage?> TryReadAsync(string imagePath, CancellationToken cancellationToken = default)
-            => Task.FromResult<BannerImage?>(new BannerImage([1, 2, 3], "image/png", imagePath));
-    }
+        public List<string> MarkedReviewedIds { get; } = [];
 
-    private sealed class FakePolicyProvider : IReviewPolicyProvider
-    {
-        public Task<ReviewPolicy> GetPolicyAsync(CancellationToken cancellationToken = default)
-            => Task.FromResult(new ReviewPolicy("Blocked", "Reviewed", []));
-    }
+        public Task<bool> ExistsByCreativeIdAsync(string creativeId, CancellationToken cancellationToken = default)
+            => Task.FromResult(false);
 
-    private sealed class FakePromptBuilder : IPromptBuilder
-    {
-        public string Build(ReviewPolicy policy) => "prompt";
-    }
+        public Task<HashSet<string>> FindExistingIframeIdsAsync(
+            IEnumerable<string> iframeIds,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<HashSet<string>>([]);
 
-    private sealed class FakeVisionAnalyzer : IBannerVisionAnalyzer
-    {
-        public Task<string?> AnalyzeAsync(BannerImage image, string prompt, CancellationToken cancellationToken = default)
-            => Task.FromResult<string?>("Reviewed");
-    }
+        public Task<bool> InsertAsync(BannerReviewDocument document, CancellationToken cancellationToken = default)
+            => Task.FromResult(true);
 
-    private sealed class FakeTelegramNotifier : ITelegramNotifier
-    {
-        public Task NotifyApiKeyIssueAsync(string details, ReviewTimingMetrics? timing = null, CancellationToken cancellationToken = default) => Task.CompletedTask;
-        public Task NotifyExceptionAsync(string context, Exception exception, ReviewTimingMetrics? timing = null, CancellationToken cancellationToken = default) => Task.CompletedTask;
-        public Task NotifyLlmNoResultAsync(string imagePath, string? rawResponse, ReviewTimingMetrics timing, CancellationToken cancellationToken = default) => Task.CompletedTask;
-        public Task NotifyReviewResultAsync(string imagePath, string verdictLabel, ReviewTimingMetrics timing, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task<IReadOnlyList<BannerReviewDocument>> FindPendingGamReviewAsync(
+            int maxCount,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<BannerReviewDocument>>([]);
+
+        public Task<bool> MarkReviewedByCreativeIdAsync(
+            string creativeId,
+            CancellationToken cancellationToken = default)
+        {
+            MarkedReviewedIds.Add(creativeId);
+            return Task.FromResult(true);
+        }
     }
 }

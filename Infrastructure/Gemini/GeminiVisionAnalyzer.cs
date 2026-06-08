@@ -1,3 +1,5 @@
+#if false
+// Tạm thời tắt Gemini (có phí API). Dùng Florence-2 local — xem Infrastructure/Florence/.
 using AdOpsAgenReviewBanner.Application.Abstractions;
 using AdOpsAgenReviewBanner.Configuration;
 using AdOpsAgenReviewBanner.Domain.Models;
@@ -102,3 +104,4 @@ public sealed class GeminiVisionAnalyzer : IBannerVisionAnalyzer, IDisposable
         _clientsByKey.Clear();
     }
 }
+#endif

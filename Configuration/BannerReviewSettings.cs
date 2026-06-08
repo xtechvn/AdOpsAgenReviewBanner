@@ -3,12 +3,17 @@ namespace AdOpsAgenReviewBanner.Configuration;
 /// <summary>Cấu hình model Gemini (section "Gemini" trong appsettings.json).</summary>
 public sealed class GeminiSettings
 {
+    /// <summary>Bật tier 2 Gemini khi Florence trả Blocked/NeedsReview.</summary>
+    public bool Enabled { get; set; } = true;
+
     public string Model { get; set; } = "gemini-2.5-flash";
 
     /// <summary>
     /// Một hoặc nhiều API key Gemini, phân tách bằng dấu phẩy. Mỗi request chọn random một key.
     /// </summary>
     public string ApiKey { get; set; } = "";
+
+    public int RequestTimeoutSeconds { get; set; } = 60;
 }
 
 /// <summary>Một danh mục nội dung bị chặn — map sang Domain.BlockedCategory.</summary>

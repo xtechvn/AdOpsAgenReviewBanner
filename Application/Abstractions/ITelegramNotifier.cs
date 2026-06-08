@@ -1,3 +1,5 @@
+using AdOpsAgenReviewBanner.Domain.Models;
+
 namespace AdOpsAgenReviewBanner.Application.Abstractions;
 
 /// <summary>Gửi thông báo vận hành qua Telegram Bot API.</summary>
@@ -24,5 +26,8 @@ public interface ITelegramNotifier
         string imagePath,
         string verdictLabel,
         ReviewTimingMetrics timing,
+        BannerModerationResult? moderation = null,
         CancellationToken cancellationToken = default);
+
+    Task NotifyBlockedActionAsync(string message, CancellationToken cancellationToken = default);
 }

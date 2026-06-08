@@ -8,3 +8,11 @@ appsettings.json
 appsettings.Production.json
 .env
 screenshots/
+
+# Chrome profile đăng nhập GAM — local/server, không commit
+Profile_Chrome/
+Profile_Chrome_*/
+Profile_Chrome_BotTest/
+
+# Florence-2 ONNX (~1 GB) — tải local lần đầu chạy, không push lên Git
+Models/

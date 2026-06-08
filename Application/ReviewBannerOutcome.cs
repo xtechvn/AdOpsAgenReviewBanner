@@ -1,11 +1,16 @@
 using AdOpsAgenReviewBanner.Domain;
+using AdOpsAgenReviewBanner.Domain.Models;
 
 namespace AdOpsAgenReviewBanner.Application;
 
 /// <summary>Kết quả use case — thay cho throw exception hoặc exit code rải rác trong Program.</summary>
 public abstract record ReviewBannerOutcome
 {
-    public sealed record Success(BannerVerdictKind Verdict, string Label) : ReviewBannerOutcome;
+    public sealed record Success(
+        BannerVerdictKind Verdict,
+        string Label,
+        BannerModerationResult? Moderation = null,
+        ReviewTimingMetrics? Timing = null) : ReviewBannerOutcome;
 
     public sealed record FileNotFound(string Path) : ReviewBannerOutcome;
 

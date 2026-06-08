@@ -1,6 +1,7 @@
 using AdOpsAgenReviewBanner.Application;
 using AdOpsAgenReviewBanner.Application.Abstractions;
 using AdOpsAgenReviewBanner.Configuration;
+using AdOpsAgenReviewBanner.Domain.Models;
 using Microsoft.Extensions.Options;
 using System.Net.Http.Headers;
 using System.Text;
@@ -91,31 +92,49 @@ public sealed class TelegramNotifier : ITelegramNotifier
         string imagePath,
         string verdictLabel,
         ReviewTimingMetrics timing,
+        BannerModerationResult? moderation = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
+            var monitorSection = TelegramModerationCaptionBuilder.BuildMonitorSection(moderation);
+
             if (!IOFile.Exists(imagePath))
             {
                 await SendTextAsync(
-                    $"✅ *Kết quả:* `{EscapeMarkdown(verdictLabel)}`\n" +
-                    $"• Ảnh: `{EscapeMarkdown(imagePath)}` (không gửi được file)\n" +
-                    $"• {EscapeMarkdown(timing.ToTelegramSummary())}",
+                    TruncateCaption(
+                        $"✅ *Kết quả:* `{EscapeMarkdown(verdictLabel)}`\n" +
+                        monitorSection +
+                        $"• Ảnh: `{EscapeMarkdown(imagePath)}` (không gửi được file)\n" +
+                        $"• {EscapeMarkdown(timing.ToTelegramSummary())}"),
                     cancellationToken);
                 return;
             }
 
-            var caption =
+            var caption = TruncateCaption(
                 $"✅ *Kết quả review banner*\n" +
                 $"• Verdict: *{EscapeMarkdown(verdictLabel)}*\n" +
+                monitorSection +
                 $"• File: `{EscapeMarkdown(Path.GetFileName(imagePath))}`\n" +
-                $"• {EscapeMarkdown(timing.ToTelegramSummary())}";
+                $"• {EscapeMarkdown(timing.ToTelegramSummary())}");
 
             await SendPhotoAsync(imagePath, caption, cancellationToken);
         }
         catch (Exception ex)
         {
             LogTelegramFailure(nameof(NotifyReviewResultAsync), ex);
+        }
+    }
+
+    public async Task NotifyBlockedActionAsync(string message, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await SendTextAsync(message, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            LogTelegramFailure(nameof(NotifyBlockedActionAsync), ex);
         }
     }
 
@@ -230,6 +249,9 @@ public sealed class TelegramNotifier : ITelegramNotifier
 
     private static string Truncate(string value, int maxLength) =>
         value.Length <= maxLength ? value : value[..maxLength] + "...";
+
+    private static string TruncateCaption(string caption, int maxLength = 1024) =>
+        caption.Length <= maxLength ? caption : caption[..(maxLength - 3)] + "...";
 
     private static void LogTelegramFailure(string method, Exception ex) =>
         Console.Error.WriteLine($"[Telegram] {method} failed: {ex.Message}");

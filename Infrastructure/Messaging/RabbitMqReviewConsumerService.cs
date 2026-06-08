@@ -13,7 +13,8 @@ namespace AdOpsAgenReviewBanner.Infrastructure.Messaging;
 /// <summary>
 /// Consumer RabbitMQ — chỉ hoạt động khi Runtime.Environment = Production.
 /// Host.RunAsync() trong Program.cs sẽ start service này tự động.
-/// Message JSON: { "link_review": "...", "mode": "reviewed"|"blocked" }
+/// Message JSON reviewed: { "link_review": "...", "mode": "reviewed", "order": 5 }
+/// Message JSON execute_plan: { "creative_id": "...", "action": "Blocked"|"Reviewed", "mode": "execute_plan" }
 /// </summary>
 public sealed class RabbitMqReviewConsumerService : BackgroundService
 {
@@ -37,20 +38,24 @@ public sealed class RabbitMqReviewConsumerService : BackgroundService
             return;
 
         var settings = _rabbitSettings.Value;
+        var workerMode = _runtimeSettings.Value.WorkerMode;
+        var consumerQueue = settings.ResolveConsumerQueueName(workerMode);
         var factory = new ConnectionFactory
         {
             HostName = settings.HostName,
             VirtualHost = settings.VirtualHost,
             UserName = settings.UserName,
             Password = settings.Password,
-            Port = settings.Port
+            Port = settings.Port,
+            // Bắt buộc với AsyncEventingBasicConsumer — thiếu flag này message có thể unacked mà không chạy handler.
+            DispatchConsumersAsync = true
         };
 
         using var connection = factory.CreateConnection();
         using var channel = connection.CreateModel();
 
         channel.QueueDeclare(
-            queue: settings.QueueName,
+            queue: consumerQueue,
             durable: true,
             exclusive: false,
             autoDelete: false,
@@ -65,12 +70,14 @@ public sealed class RabbitMqReviewConsumerService : BackgroundService
         };
 
         channel.BasicConsume(
-            queue: settings.QueueName,
+            queue: consumerQueue,
             autoAck: false,
             consumer: consumer);
 
         Console.WriteLine(
-            $" [*] Waiting for messages on queue={settings.QueueName}, workerMode={_runtimeSettings.Value.WorkerMode}");
+            $" [*] RabbitMQ connected: {settings.HostName}:{settings.Port} vhost={settings.VirtualHost}");
+        Console.WriteLine(
+            $" [*] Waiting for messages on queue={consumerQueue}, workerMode={workerMode}");
 
         while (!stoppingToken.IsCancellationRequested)
             await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
@@ -98,6 +105,19 @@ public sealed class RabbitMqReviewConsumerService : BackgroundService
                 return;
             }
 
+            if (!QueueModeHelper.TryParse(message.Mode, out var messageMode)
+                || messageMode != _runtimeSettings.Value.WorkerMode)
+            {
+                Console.Error.WriteLine(
+                    $"Skip message mode={message.Mode}, worker={_runtimeSettings.Value.WorkerMode} — requeue (chạy đúng worker/queue).");
+                channel.BasicNack(ea.DeliveryTag, false, requeue: true);
+                return;
+            }
+
+            Console.WriteLine(_runtimeSettings.Value.WorkerMode == WorkerMode.ExecutePlan
+                ? "Bắt đầu ExecutePlan — mở Chrome GAM, Allow/Block creative."
+                : "Bắt đầu Reviewed — mở Chrome GAM, Florence sau khi chụp banner.");
+
             using var scope = _scopeFactory.CreateScope();
             var processor = scope.ServiceProvider.GetRequiredService<ReviewQueueMessageProcessor>();
             var result = await processor.ProcessAsync(message, cancellationToken);
@@ -105,14 +125,15 @@ public sealed class RabbitMqReviewConsumerService : BackgroundService
             switch (result)
             {
                 case QueueProcessResult.SkippedModeMismatch:
-                    Console.WriteLine(
-                        $"Skip message mode={message.Mode}, worker={_runtimeSettings.Value.WorkerMode}");
-                    break;
+                    Console.Error.WriteLine(
+                        $"Mode mismatch sau validate — mode={message.Mode}, worker={_runtimeSettings.Value.WorkerMode}");
+                    channel.BasicNack(ea.DeliveryTag, false, requeue: true);
+                    return;
                 case QueueProcessResult.InvalidMessage:
                     Console.Error.WriteLine("Message không hợp lệ. Ack bỏ qua.");
                     break;
-                case QueueProcessResult.FetchImageFailed:
-                    Console.Error.WriteLine("Không tải được ảnh từ link_review.");
+                case QueueProcessResult.BlockedActionFailed:
+                    Console.Error.WriteLine("Blocked action GAM thất bại (creative_id / Selenium).");
                     break;
             }
 

@@ -1,8 +1,28 @@
 {
   "profiles": {
-    "TEST - Quét folder image_test": {
+    "PRODUCTION - RabbitMQ": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Production"
+      }
+    },
+    "TEST - ExecutePlan (Mongo is_review=0)": {
       "commandName": "Project",
       "commandLineArgs": "",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Production"
+      }
+    },
+    "TEST - Link GAM (Selenium)": {
+      "commandName": "Project",
+      "commandLineArgs": "",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Development"
+      }
+    },
+    "TEST - Quét folder image_test": {
+      "commandName": "Project",
+      "commandLineArgs": "image_test",
       "environmentVariables": {
         "DOTNET_ENVIRONMENT": "Development"
       }
@@ -14,23 +34,11 @@
         "DOTNET_ENVIRONMENT": "Development"
       }
     },
-    "TEST - Link GAM (Selenium)": {
+    "TEST - Link GAM (URL tùy chỉnh)": {
       "commandName": "Project",
-      "commandLineArgs": "https://admanager.google.com/",
+      "commandLineArgs": "https://admanager.google.com/27973503#creatives/ad_review_center",
       "environmentVariables": {
         "DOTNET_ENVIRONMENT": "Development"
-      }
-    },
-    "PRODUCTION - RabbitMQ Reviewed": {
-      "commandName": "Project",
-      "environmentVariables": {
-        "DOTNET_ENVIRONMENT": "Production"
-      }
-    },
-    "PRODUCTION - RabbitMQ Blocked": {
-      "commandName": "Project",
-      "environmentVariables": {
-        "DOTNET_ENVIRONMENT": "ProductionBlocked"
       }
     },
     "Container (Dockerfile)": {

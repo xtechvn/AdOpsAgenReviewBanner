@@ -1,6 +1,6 @@
 using AdOpsAgenReviewBanner.Application.Queue;
-using Xunit;
 using AdOpsAgenReviewBanner.Configuration;
+using Xunit;
 
 namespace AdOpsAgenReviewBanner.Tests;
 
@@ -9,8 +9,8 @@ public class QueueModeHelperTests
     [Theory]
     [InlineData("reviewed", WorkerMode.Reviewed)]
     [InlineData("Reviewed", WorkerMode.Reviewed)]
-    [InlineData("blocked", WorkerMode.Blocked)]
-    [InlineData("BLOCKED", WorkerMode.Blocked)]
+    [InlineData("execute_plan", WorkerMode.ExecutePlan)]
+    [InlineData("EXECUTE_PLAN", WorkerMode.ExecutePlan)]
     public void TryParse_ValidModes_ReturnsTrue(string input, WorkerMode expected)
     {
         var ok = QueueModeHelper.TryParse(input, out var mode);
@@ -21,6 +21,7 @@ public class QueueModeHelperTests
     [Theory]
     [InlineData("")]
     [InlineData("unknown")]
+    [InlineData("blocked")]
     [InlineData("pending")]
     public void TryParse_InvalidModes_ReturnsFalse(string input)
     {

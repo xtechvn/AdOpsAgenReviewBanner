@@ -5,25 +5,31 @@ using AdOpsAgenReviewBanner.Configuration;
 using AdOpsAgenReviewBanner.Domain.Services;
 using AdOpsAgenReviewBanner.Infrastructure.Configuration;
 using AdOpsAgenReviewBanner.Infrastructure.Files;
+using AdOpsAgenReviewBanner.Infrastructure.Florence;
 using AdOpsAgenReviewBanner.Infrastructure.Gemini;
 using AdOpsAgenReviewBanner.Infrastructure.Messaging;
 using AdOpsAgenReviewBanner.Infrastructure.Mongo;
 using AdOpsAgenReviewBanner.Infrastructure.Prompting;
 using AdOpsAgenReviewBanner.Infrastructure.Selenium;
 using AdOpsAgenReviewBanner.Infrastructure.Telegram;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace AdOpsAgenReviewBanner.DependencyInjection;
 
 /// <summary>
 /// Đăng ký Dependency Injection (DI): map interface → class triển khai.
-/// Gọi một lần từ Program.cs: builder.Services.AddBannerReview().
+/// Gọi một lần từ Program.cs: builder.Services.AddBannerReview(configuration).
 /// </summary>
 public static class ServiceCollectionExtensions
 {
-    public static IServiceCollection AddBannerReview(this IServiceCollection services)
+    public static IServiceCollection AddBannerReview(
+        this IServiceCollection services,
+        IConfiguration configuration)
     {
-        // --- Đọc cấu hình từ appsettings.json ---
+        services.AddOptions<FlorenceSettings>()
+            .BindConfiguration("Florence");
+
         services.AddOptions<GeminiSettings>()
             .BindConfiguration("Gemini");
 
@@ -48,39 +54,72 @@ public static class ServiceCollectionExtensions
         services.AddOptions<GamReviewSettings>()
             .BindConfiguration("GamReview");
 
-        services.AddHttpClient<ITelegramNotifier, TelegramNotifier>();
+        services.AddOptions<KeywordApiSettings>()
+            .BindConfiguration("KeywordApi");
 
-        // --- Domain / Application: lõi review 1 ảnh ---
+        services.AddHttpClient<ITelegramNotifier, TelegramNotifier>();
+        services.AddHttpClient<HttpKeywordCatalogProvider>();
+
+        var workerMode = WorkerCapability.ResolveWorkerMode(configuration);
+        var requiresFlorence = WorkerCapability.RequiresFlorence(workerMode);
+
+        if (requiresFlorence)
+        {
+            AddFlorenceReviewStack(services);
+        }
+
+        AddSeleniumAndQueueStack(services, workerMode);
+
+        services.AddHostedService<RabbitMqReviewConsumerService>();
+
+        return services;
+    }
+
+    private static void AddFlorenceReviewStack(IServiceCollection services)
+    {
         services.AddSingleton<IVerdictParser, VerdictParser>();
         services.AddSingleton<IReviewPolicyProvider, AppSettingsPolicyProvider>();
-        services.AddSingleton<IImageReader, LocalImageReader>();              // đọc file ảnh local
+        services.AddSingleton<IImageReader, LocalImageReader>();
         services.AddSingleton<IPromptBuilder, BannerReviewPromptBuilder>();
+
+        services.AddSingleton<IOcrTextExtractor, TesseractOcrExtractor>();
+        services.AddSingleton<IKeywordCatalogProvider, CompositeKeywordCatalogProvider>();
+        services.AddSingleton<BannerKeywordMatcher>();
+        services.AddSingleton<IBannerModerationResultHolder, BannerModerationResultHolder>();
+        services.AddSingleton<IBannerModerationScanner, FlorenceBannerModerationScanner>();
         services.AddSingleton<IGeminiApiKeyProvider, RandomGeminiApiKeyProvider>();
+        services.AddSingleton<GeminiBannerVerifier>();
+        services.AddSingleton<IGeminiBannerVerifier>(sp => sp.GetRequiredService<GeminiBannerVerifier>());
+        services.AddSingleton<TieredBannerVisionAnalyzer>();
+        services.AddSingleton<IBannerVisionAnalyzer>(sp => sp.GetRequiredService<TieredBannerVisionAnalyzer>());
 
-        services.AddSingleton<GeminiVisionAnalyzer>();
-        services.AddSingleton<IBannerVisionAnalyzer>(sp => sp.GetRequiredService<GeminiVisionAnalyzer>());
-
-        services.AddSingleton<ReviewBannerUseCase>();       // ← logic chính: ảnh → Gemini → Blocked/Reviewed
-        services.AddSingleton<ReviewBannerBatchRunner>();   // quét folder (TEST, không args)
-
-        // --- Queue / Selenium: dùng khi có link_review (Production hoặc TEST URL) ---
-        services.AddSingleton<ChromeDriverFactory>();
+        services.AddSingleton<ReviewBannerUseCase>();
+        services.AddSingleton<ReviewBannerBatchRunner>();
         services.AddSingleton<ILinkImageFetcher, SeleniumLinkImageFetcher>();
-        services.AddSingleton<IBannerReviewRepository, MongoBannerReviewRepository>();
+        services.AddSingleton<IExecutePlanQueuePublisher, RabbitMqExecutePlanQueuePublisher>();
+        services.AddSingleton<GamGeneralAdCategoryFilter>();
         services.AddSingleton<IGamAdReviewWorkflow, GamAdReviewCenterWorkflow>();
+    }
+
+    private static void AddSeleniumAndQueueStack(IServiceCollection services, WorkerMode workerMode)
+    {
+        services.AddSingleton<ChromeDriverFactory>();
+        services.AddSingleton<IBannerReviewRepository, MongoBannerReviewRepository>();
+        services.AddSingleton<IGamBlockedActionWorkflow, GamBlockedActionWorkflow>();
+        services.AddSingleton<BlockedPendingReviewRunner>();
+
         services.AddScoped<ReviewQueueMessageProcessor>(sp =>
         {
             var runtime = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<RuntimeSettings>>().Value;
             return new ReviewQueueMessageProcessor(
-                sp.GetRequiredService<IGamAdReviewWorkflow>(),
-                sp.GetRequiredService<ILinkImageFetcher>(),
-                sp.GetRequiredService<ReviewBannerUseCase>(),
-                runtime.WorkerMode); // strict-filter: chỉ xử lý message cùng mode
+                runtime.WorkerMode == WorkerMode.Reviewed
+                    ? sp.GetRequiredService<IGamAdReviewWorkflow>()
+                    : null,
+                runtime.WorkerMode == WorkerMode.ExecutePlan
+                    ? sp.GetRequiredService<IGamBlockedActionWorkflow>()
+                    : null,
+                sp.GetRequiredService<IBannerReviewRepository>(),
+                runtime.WorkerMode);
         });
-
-        // Chạy nền khi Production; ở Test thì service return ngay, không kết nối RabbitMQ
-        services.AddHostedService<RabbitMqReviewConsumerService>();
-
-        return services;
     }
 }

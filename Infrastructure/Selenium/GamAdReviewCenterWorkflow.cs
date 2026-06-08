@@ -1,9 +1,12 @@
+using System.Diagnostics;
 using System.Text.Json;
 using AdOpsAgenReviewBanner.Application;
 using AdOpsAgenReviewBanner.Application.Abstractions;
+using AdOpsAgenReviewBanner.Application.Queue;
 using AdOpsAgenReviewBanner.Configuration;
 using AdOpsAgenReviewBanner.Domain;
 using AdOpsAgenReviewBanner.Domain.Models;
+using AdOpsAgenReviewBanner.Infrastructure.Florence;
 using Microsoft.Extensions.Options;
 using OpenQA.Selenium;
 using OpenQA.Selenium.Chrome;
@@ -12,14 +15,17 @@ using OpenQA.Selenium.Support.UI;
 namespace AdOpsAgenReviewBanner.Infrastructure.Selenium;
 
 /// <summary>
-/// Reviewed mode: mở link_review → click banner đầu → lightbox → chụp preview → Gemini → Mongo.
-/// Duyệt hết bằng nút "Display the next ad."; creative_id đã có trong Mongo thì bỏ qua.
+/// Reviewed mode: mở link_review → preview queue (nút "Display the next ad.") → Next page grid → lặp.
+/// Trước khi mở preview: quét iframe id trên listing → so Mongo iframe_id → skip / next page.
+/// Dừng khi không còn nút Next preview và không còn Next page grid. HashSet creative_id chống loop.
 /// </summary>
 public sealed class GamAdReviewCenterWorkflow : IGamAdReviewWorkflow
 {
     private readonly ChromeDriverFactory _chromeDriverFactory;
     private readonly ReviewBannerUseCase _useCase;
     private readonly IBannerReviewRepository _repository;
+    private readonly IExecutePlanQueuePublisher _executePlanQueuePublisher;
+    private readonly GamGeneralAdCategoryFilter _categoryFilter;
     private readonly ITelegramNotifier _telegram;
     private readonly GamReviewSettings _gamSettings;
 
@@ -27,28 +33,40 @@ public sealed class GamAdReviewCenterWorkflow : IGamAdReviewWorkflow
         ChromeDriverFactory chromeDriverFactory,
         ReviewBannerUseCase useCase,
         IBannerReviewRepository repository,
+        IExecutePlanQueuePublisher executePlanQueuePublisher,
+        GamGeneralAdCategoryFilter categoryFilter,
         ITelegramNotifier telegram,
         IOptions<GamReviewSettings> gamSettings)
     {
         _chromeDriverFactory = chromeDriverFactory;
         _useCase = useCase;
         _repository = repository;
+        _executePlanQueuePublisher = executePlanQueuePublisher;
+        _categoryFilter = categoryFilter;
         _telegram = telegram;
         _gamSettings = gamSettings.Value;
     }
 
     public async Task<GamReviewWorkflowResult> ProcessReviewListAsync(
         string listUrl,
+        int categoryOrder,
+        string? categoryName = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(listUrl))
             throw new ArgumentException("link_review không được rỗng.", nameof(listUrl));
 
+        if (categoryOrder < 1)
+            throw new ArgumentOutOfRangeException(nameof(categoryOrder), categoryOrder, "order phải >= 1.");
+
         ChromeDriver? driver = null;
         var processed = 0;
         var skipped = 0;
+        var skippedPreview = 0;
         var reviewed = 0;
         var errors = 0;
+        var gridPages = 0;
+        var seenCreativeIds = new HashSet<string>(StringComparer.Ordinal);
 
         try
         {
@@ -56,77 +74,102 @@ public sealed class GamAdReviewCenterWorkflow : IGamAdReviewWorkflow
             driver.Navigate().GoToUrl(listUrl);
 
             var gridWait = CreateWait(driver, _gamSettings.GridWaitSeconds);
-            var firstCard = gridWait.Until(WaitUntilVisible(By.XPath(GamReviewSelectors.FirstAdPreviewCard)));
-            firstCard.Click();
-
+            _categoryFilter.Apply(driver, gridWait, categoryOrder, cancellationToken);
             var lightboxWait = CreateWait(driver, _gamSettings.LightboxWaitSeconds);
-            lightboxWait.Until(WaitUntilVisible(By.XPath(GamReviewSelectors.LightboxCreativePreview)));
-
-            string? previousCreativeId = null;
+            var nextAdWait = CreateWait(driver, _gamSettings.NextAdWaitSeconds);
 
             while (!cancellationToken.IsCancellationRequested)
             {
-                try
+                gridPages++;
+                var pageLabel = GamGridPagination.TryReadPaginationLabel(driver);
+                Console.WriteLine(
+                    pageLabel is null
+                        ? $"── Grid trang {gridPages} ──"
+                        : $"── Grid trang {gridPages}: {pageLabel} ──");
+
+                var gridOpen = await TryOpenFirstUnreviewedFromGridAsync(
+                    driver,
+                    gridWait,
+                    lightboxWait,
+                    cancellationToken);
+                skipped += gridOpen.SkippedOnPage;
+
+                if (gridOpen.Result == GridOpenResult.AllPageInMongo)
                 {
-                    var creativeId = ReadCreativeId(driver);
-                    if (string.IsNullOrWhiteSpace(creativeId))
+                    if (!_gamSettings.EnableGridPagination)
                     {
-                        Console.Error.WriteLine("Không đọc được creative_id — dừng vòng lặp.");
-                        errors++;
+                        Console.WriteLine("EnableGridPagination=false — dừng sau khi skip cả trang.");
                         break;
                     }
 
-                    if (creativeId == previousCreativeId)
+                    if (!TryAdvanceGridPage(driver, gridWait, out var allPageEndReason))
                     {
-                        Console.WriteLine($"creative_id lặp ({creativeId}) — hết danh sách.");
-                        break;
-                    }
-
-                    previousCreativeId = creativeId;
-                    processed++;
-
-                    if (await _repository.ExistsByCreativeIdAsync(creativeId, cancellationToken))
-                    {
-                        Console.WriteLine($"Skip creative_id đã tồn tại: {creativeId}");
-                        skipped++;
-                    }
-                    else
-                    {
-                        var outcome = await ReviewAndSaveAsync(driver, creativeId, cancellationToken);
-                        if (outcome)
-                            reviewed++;
-                        else
+                        Console.WriteLine(allPageEndReason);
+                        if (allPageEndReason.Contains("thất bại", StringComparison.OrdinalIgnoreCase)
+                            || allPageEndReason.Contains("Không tìm thấy", StringComparison.OrdinalIgnoreCase))
                             errors++;
-
-                        if (_gamSettings.GeminiDelaySeconds > 0)
-                            await Task.Delay(TimeSpan.FromSeconds(_gamSettings.GeminiDelaySeconds), cancellationToken);
+                        break;
                     }
 
-                    if (!TryClickNextAd(driver))
-                        break;
+                    continue;
+                }
 
-                    lightboxWait.Until(d =>
-                    {
-                        var id = ReadCreativeId(d);
-                        return !string.IsNullOrWhiteSpace(id) && id != creativeId;
-                    });
-                }
-                catch (Exception ex)
+                if (gridOpen.Result is GridOpenResult.NoCards or GridOpenResult.Failed)
                 {
+                    Console.Error.WriteLine(
+                        gridOpen.Result == GridOpenResult.NoCards
+                            ? "Không tìm thấy banner trên lưới — dừng job."
+                            : "Không mở được preview từ lưới — dừng job.");
                     errors++;
-                    Console.Error.WriteLine($"Lỗi xử lý banner: {ex.Message}");
-                    await _telegram.NotifyExceptionAsync(nameof(ProcessReviewListAsync), ex, cancellationToken: cancellationToken);
-                    if (!TryClickNextAd(driver))
-                        break;
+                    break;
                 }
+
+                var queueStats = await RunPreviewQueueAsync(
+                    driver,
+                    seenCreativeIds,
+                    nextAdWait,
+                    listUrl,
+                    categoryOrder,
+                    categoryName,
+                    cancellationToken);
+                processed += queueStats.Processed;
+                skipped += queueStats.Skipped;
+                skippedPreview += queueStats.SkippedPreview;
+                reviewed += queueStats.Reviewed;
+                errors += queueStats.Errors;
+
+                if (!GamGridPagination.TryCloseLightboxAndReturnToGrid(driver))
+                {
+                    Console.Error.WriteLine("Không đóng được lightbox / chưa về listing — dừng job.");
+                    errors++;
+                    break;
+                }
+
+                if (!_gamSettings.EnableGridPagination)
+                {
+                    Console.WriteLine("EnableGridPagination=false — dừng sau 1 lượt preview queue.");
+                    break;
+                }
+
+                if (!TryAdvanceGridPage(driver, gridWait, out var endReason))
+                {
+                    Console.WriteLine(endReason);
+                    if (endReason.Contains("thất bại", StringComparison.OrdinalIgnoreCase)
+                        || endReason.Contains("Không tìm thấy", StringComparison.OrdinalIgnoreCase))
+                        errors++;
+                    break;
+                }
+
             }
 
             return new GamReviewWorkflowResult
             {
                 ProcessedCount = processed,
                 SkippedExistingCount = skipped,
+                SkippedPreviewCount = skippedPreview,
                 ReviewedCount = reviewed,
-                ErrorCount = errors
+                ErrorCount = errors,
+                GridPagesProcessed = gridPages
             };
         }
         finally
@@ -136,17 +179,288 @@ public sealed class GamAdReviewCenterWorkflow : IGamAdReviewWorkflow
         }
     }
 
+    private async Task<PreviewQueueStats> RunPreviewQueueAsync(
+        ChromeDriver driver,
+        HashSet<string> seenCreativeIds,
+        WebDriverWait nextAdWait,
+        string linkReview,
+        int categoryOrder,
+        string? categoryName,
+        CancellationToken cancellationToken)
+    {
+        var stats = new PreviewQueueStats();
+        string? previousCreativeId = null;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                if (previousCreativeId is not null)
+                    WaitForNextCreativePreview(driver, nextAdWait, previousCreativeId);
+
+                var creativeId = ReadCreativeId(driver);
+                if (string.IsNullOrWhiteSpace(creativeId))
+                {
+                    Console.Error.WriteLine("Không đọc được creative_id — thử Next ad.");
+                    stats.Errors++;
+                    if (!TryAdvancePreviewOrStop(driver, "Không đọc được creative_id"))
+                        break;
+                    continue;
+                }
+
+                if (seenCreativeIds.Contains(creativeId))
+                {
+                    Console.WriteLine(
+                        $"creative_id {creativeId} đã gặp trong phiên — hết preview queue (chống loop).");
+                    break;
+                }
+
+                seenCreativeIds.Add(creativeId);
+                previousCreativeId = creativeId;
+                stats.Processed++;
+
+                if (await _repository.ExistsByCreativeIdAsync(creativeId, cancellationToken))
+                {
+                    Console.WriteLine($"Skip creative_id đã tồn tại (bỏ qua chờ preview): {creativeId}");
+                    stats.Skipped++;
+                }
+                else
+                {
+                    var bannerAppearWatch = Stopwatch.StartNew();
+                    var loadState = GamPreviewLoadWatcher.WaitUntilSettled(driver, _gamSettings, creativeId);
+                    var previewWait = bannerAppearWatch.Elapsed;
+
+                    if (loadState is PreviewLoadState.Undersized
+                        or PreviewLoadState.NoIframe
+                        or PreviewLoadState.SpinnerTimeout)
+                    {
+                        var dims = GamPreviewInspector.TryGetRenderedPreviewDimensions(driver);
+                        var skipReason = loadState switch
+                        {
+                            PreviewLoadState.Undersized => PreviewSkipReason.Undersized,
+                            PreviewLoadState.SpinnerTimeout => PreviewSkipReason.SpinnerLoading,
+                            _ => PreviewSkipReason.NoIframe
+                        };
+                        Console.WriteLine(GamPreviewInspector.FormatSkipMessage(skipReason, creativeId, dims, _gamSettings));
+                        stats.SkippedPreview++;
+                    }
+                    else
+                    {
+                        var outcome = await ReviewAndSaveAsync(
+                            driver,
+                            creativeId,
+                            previewWait,
+                            linkReview,
+                            categoryOrder,
+                            categoryName,
+                            cancellationToken);
+                        if (outcome)
+                            stats.Reviewed++;
+                        else
+                            stats.Errors++;
+
+                        if (_gamSettings.GeminiDelaySeconds > 0)
+                            await Task.Delay(TimeSpan.FromSeconds(_gamSettings.GeminiDelaySeconds), cancellationToken);
+                    }
+                }
+
+                if (!TryAdvancePreviewOrStop(driver, "Hết banner trong preview queue"))
+                    break;
+            }
+            catch (Exception ex)
+            {
+                stats.Errors++;
+                Console.Error.WriteLine($"Lỗi xử lý banner: {ex.Message}");
+                await _telegram.NotifyExceptionAsync(nameof(RunPreviewQueueAsync), ex, cancellationToken: cancellationToken);
+                if (!TryAdvancePreviewOrStop(driver, "Lỗi xử lý banner"))
+                    break;
+            }
+        }
+
+        return stats;
+    }
+
+    private sealed class PreviewQueueStats
+    {
+        public int Processed { get; set; }
+        public int Skipped { get; set; }
+        public int SkippedPreview { get; set; }
+        public int Reviewed { get; set; }
+        public int Errors { get; set; }
+    }
+
+    private enum GridOpenResult
+    {
+        Opened,
+        AllPageInMongo,
+        NoCards,
+        Failed
+    }
+
+    private sealed record GridOpenAttempt(GridOpenResult Result, int SkippedOnPage);
+
+    private async Task<GridOpenAttempt> TryOpenFirstUnreviewedFromGridAsync(
+        ChromeDriver driver,
+        WebDriverWait gridWait,
+        WebDriverWait lightboxWait,
+        CancellationToken cancellationToken)
+    {
+        if (GamGridPagination.IsPreviewPanelOpen(driver)
+            && !string.IsNullOrWhiteSpace(ReadCreativeId(driver)))
+            return new GridOpenAttempt(GridOpenResult.Opened, 0);
+
+        if (GamGridPagination.IsPreviewPanelOpen(driver))
+            GamGridPagination.TryCloseLightboxAndReturnToGrid(driver);
+
+        try
+        {
+            gridWait.Until(WaitUntilVisible(By.XPath(GamReviewSelectors.GridReviewableRows)));
+        }
+        catch (WebDriverTimeoutException)
+        {
+            return new GridOpenAttempt(GridOpenResult.NoCards, 0);
+        }
+
+        var cards = GamGridListingScanner.ScanListingCards(driver);
+        if (cards.Count == 0)
+            return new GridOpenAttempt(GridOpenResult.NoCards, 0);
+
+        var iframeIds = cards
+            .Select(c => c.IframeId)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var existingInMongo = await _repository.FindExistingIframeIdsAsync(iframeIds, cancellationToken);
+
+        var skippedOnPage = 0;
+        foreach (var card in cards)
+        {
+            if (!string.IsNullOrWhiteSpace(card.IframeId)
+                && existingInMongo.Contains(card.IframeId))
+            {
+                skippedOnPage++;
+                Console.WriteLine($"[Grid] Skip iframe đã có Mongo: {card.IframeId}");
+                continue;
+            }
+
+            var label = string.IsNullOrWhiteSpace(card.IframeId)
+                ? "(chưa có iframe — card đang load)"
+                : card.IframeId;
+            Console.WriteLine($"[Grid] Mở banner mới: iframe_id={label}");
+
+            try
+            {
+                card.ClickTarget.Click();
+                WaitForPreviewPanelReady(driver, lightboxWait);
+                return new GridOpenAttempt(GridOpenResult.Opened, skippedOnPage);
+            }
+            catch (ElementClickInterceptedException)
+            {
+                try
+                {
+                    ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", card.ClickTarget);
+                    WaitForPreviewPanelReady(driver, lightboxWait);
+                    return new GridOpenAttempt(GridOpenResult.Opened, skippedOnPage);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Grid] Click card thất bại: {ex.Message}");
+                    return new GridOpenAttempt(GridOpenResult.Failed, skippedOnPage);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Grid] Click card thất bại: {ex.Message}");
+                return new GridOpenAttempt(GridOpenResult.Failed, skippedOnPage);
+            }
+        }
+
+        Console.WriteLine($"[Grid] Cả {cards.Count} banner trên trang đã có trong Mongo — next page.");
+        return new GridOpenAttempt(GridOpenResult.AllPageInMongo, skippedOnPage);
+    }
+
+    private static bool TryAdvanceGridPage(IWebDriver driver, WebDriverWait gridWait, out string reason)
+    {
+        var gridNextState = GamGridPagination.GetGridNextPageState(driver);
+        switch (gridNextState)
+        {
+            case GridNextPageState.Disabled:
+                reason = "[Grid] Next page disabled — hết banner toàn bộ listing, hoàn tất job.";
+                return false;
+            case GridNextPageState.NotFound:
+                reason = "[Grid] Không tìm thấy nút Next page — dừng job.";
+                return false;
+            case GridNextPageState.Enabled:
+                if (!GamGridPagination.TryClickGridNextPage(driver))
+                {
+                    reason = "[Grid] Next page enabled nhưng click thất bại — dừng job.";
+                    return false;
+                }
+
+                gridWait.Until(WaitUntilVisible(By.XPath(GamReviewSelectors.GridReviewableRows)));
+                reason = "";
+                return true;
+            default:
+                reason = "[Grid] Trạng thái phân trang không xác định — dừng job.";
+                return false;
+        }
+    }
+
+    private static bool TryAdvancePreviewOrStop(IWebDriver driver, string stopReason)
+    {
+        if (IsNextAdAvailable(driver) && TryClickNextAd(driver))
+            return true;
+
+        Console.WriteLine($"{stopReason} — nút 'Display the next ad.' không còn hoặc disabled.");
+        return false;
+    }
+
+    private static bool IsNextAdAvailable(IWebDriver driver)
+    {
+        try
+        {
+            var next = driver.FindElement(By.XPath(GamReviewSelectors.NextAdButton));
+            if (!next.Displayed)
+                return false;
+
+            var disabled = next.GetDomAttribute("aria-disabled");
+            return !string.Equals(disabled, "true", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (NoSuchElementException)
+        {
+            return false;
+        }
+        catch (StaleElementReferenceException)
+        {
+            return false;
+        }
+    }
+
     private async Task<bool> ReviewAndSaveAsync(
         ChromeDriver driver,
         string creativeId,
+        TimeSpan previewWait,
+        string linkReview,
+        int categoryOrder,
+        string? categoryName,
         CancellationToken cancellationToken)
     {
         try
         {
-            var preview = driver.FindElement(By.XPath(GamReviewSelectors.LightboxCreativePreview));
-            var imagePath = SaveElementScreenshot(preview, creativeId);
+            var preview = FindVisibleAdPreviewTarget(driver)
+                ?? throw new NoSuchElementException("Không tìm thấy vùng preview để chụp ảnh.");
 
-            var outcome = await _useCase.ExecuteAsync(imagePath, cancellationToken);
+            var captureWatch = Stopwatch.StartNew();
+            var imagePath = await CapturePreviewWithSpinnerRetryAsync(preview, creativeId, cancellationToken);
+            captureWatch.Stop();
+
+            Console.WriteLine("⏱ [Bước 3] Bắt đầu phân tích Florence-2...");
+            var outcome = await _useCase.ExecuteAsync(
+                imagePath,
+                cancellationToken,
+                previewWait,
+                captureWatch.Elapsed);
+            Console.WriteLine($"⏱ [Bước 3] Xong — {MapOutcomeLabel(outcome)}");
             var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             var iframeId = TryReadIframeId(driver);
 
@@ -166,18 +480,29 @@ public sealed class GamAdReviewCenterWorkflow : IGamAdReviewWorkflow
                 url = "",
                 process_time = now,
                 bot_index = _gamSettings.BotIndex,
-                is_review = 1,
-                review_time = now,
+                is_review = 0,
+                review_time = 0,
                 note = note,
-                detect_info = JsonSerializer.Serialize(new
-                {
-                    verdict = note,
-                    model = "gemini",
-                    reviewed_at = now
-                })
+                category_name = string.IsNullOrWhiteSpace(categoryName) ? null : categoryName.Trim(),
+                user_name = "n8n",
+                detect_info = BuildDetectInfo(outcome, note, now)
             };
 
-            await _repository.InsertAsync(doc, cancellationToken);
+            var inserted = await _repository.InsertAsync(doc, cancellationToken);
+            if (inserted)
+            {
+                await _executePlanQueuePublisher.PublishAfterMongoInsertAsync(
+                    new ExecutePlanPublishRequest
+                    {
+                        CreativeId = creativeId,
+                        IsBlockAds = isBlocked,
+                        LinkReview = linkReview,
+                        Order = categoryOrder,
+                        Category = string.IsNullOrWhiteSpace(categoryName) ? null : categoryName.Trim()
+                    },
+                    cancellationToken);
+            }
+
             Console.WriteLine($"Đã lưu Mongo creative_id={creativeId}, is_block_ads={isBlocked}");
             return outcome is ReviewBannerOutcome.Success;
         }
@@ -187,6 +512,27 @@ public sealed class GamAdReviewCenterWorkflow : IGamAdReviewWorkflow
             return false;
         }
     }
+
+    private static string BuildDetectInfo(ReviewBannerOutcome outcome, string? note, long reviewedAtUnix) =>
+        outcome is ReviewBannerOutcome.Success { Moderation: { } moderation } success
+            ? FlorenceDetectInfoBuilder.ToJson(moderation, success.Label, reviewedAtUnix, success.Timing)
+            : JsonSerializer.Serialize(new
+            {
+                verdict = note,
+                model = "florence2",
+                reviewed_at = reviewedAtUnix
+            });
+
+    private static string MapOutcomeLabel(ReviewBannerOutcome outcome) =>
+        outcome switch
+        {
+            ReviewBannerOutcome.Success success => success.Label,
+            ReviewBannerOutcome.InvalidResponse invalid => $"Invalid: {invalid.RawText}",
+            ReviewBannerOutcome.ApiError api => $"Error: {api.Message}",
+            ReviewBannerOutcome.FileNotFound notFound => $"FileNotFound: {notFound.Path}",
+            ReviewBannerOutcome.MissingApiKey => "MissingApiKey",
+            _ => outcome.GetType().Name
+        };
 
     private (bool isBlocked, string? note) MapOutcome(ReviewBannerOutcome outcome) =>
         outcome switch
@@ -200,6 +546,34 @@ public sealed class GamAdReviewCenterWorkflow : IGamAdReviewWorkflow
             ReviewBannerOutcome.FileNotFound notFound => (false, $"FileNotFound: {notFound.Path}"),
             _ => (false, "Unknown")
         };
+
+    private async Task<string> CapturePreviewWithSpinnerRetryAsync(
+        IWebElement preview,
+        string creativeId,
+        CancellationToken cancellationToken)
+    {
+        var screenshotWatch = Stopwatch.StartNew();
+        var imagePath = SaveElementScreenshot(preview, creativeId);
+        screenshotWatch.Stop();
+        Console.WriteLine(
+            $"⏱ [Bước 2] Chụp ảnh: {screenshotWatch.ElapsedMilliseconds}ms → {Path.GetFileName(imagePath)}");
+
+        if (!BannerTopLeftSpinnerDetector.HasLoadingSpinner(imagePath, _gamSettings))
+            return imagePath;
+
+        var retrySec = Math.Max(1, _gamSettings.PreviewScreenshotRetryDelaySeconds);
+        Console.WriteLine(
+            $"⏱ [Bước 2] Phát hiện icon loading góc trên-trái — delay {retrySec}s rồi chụp lại...");
+        await Task.Delay(TimeSpan.FromSeconds(retrySec), cancellationToken);
+
+        screenshotWatch.Restart();
+        imagePath = SaveElementScreenshot(preview, creativeId);
+        screenshotWatch.Stop();
+        Console.WriteLine(
+            $"⏱ [Bước 2] Chụp lại: {screenshotWatch.ElapsedMilliseconds}ms → {Path.GetFileName(imagePath)}");
+
+        return imagePath;
+    }
 
     private static string SaveElementScreenshot(IWebElement element, string creativeId)
     {
@@ -222,28 +596,38 @@ public sealed class GamAdReviewCenterWorkflow : IGamAdReviewWorkflow
 
     private static string ReadCreativeId(IWebDriver driver)
     {
-        try
+        foreach (var xpath in GamReviewSelectors.CreativeIdCandidates)
         {
-            var el = driver.FindElement(By.XPath(GamReviewSelectors.CreativeIdInLightbox));
-            return el.Text.Trim();
+            try
+            {
+                var el = driver.FindElement(By.XPath(xpath));
+                var text = el.Text.Trim();
+                if (!string.IsNullOrWhiteSpace(text))
+                    return text;
+            }
+            catch (NoSuchElementException)
+            {
+            }
         }
-        catch
-        {
-            return "";
-        }
+
+        return "";
     }
 
     private static string TryReadIframeId(IWebDriver driver)
     {
-        try
+        foreach (var xpath in GamReviewSelectors.PreviewIframeIdCandidates)
         {
-            var el = driver.FindElement(By.XPath(GamReviewSelectors.LightboxIframeId));
-            return el.GetDomAttribute("id") ?? "";
+            try
+            {
+                var el = driver.FindElement(By.XPath(xpath));
+                return el.GetDomAttribute("id") ?? "";
+            }
+            catch (NoSuchElementException)
+            {
+            }
         }
-        catch
-        {
-            return "";
-        }
+
+        return "";
     }
 
     private static bool TryClickNextAd(IWebDriver driver)
@@ -256,7 +640,6 @@ public sealed class GamAdReviewCenterWorkflow : IGamAdReviewWorkflow
                 return false;
 
             next.Click();
-            Thread.Sleep(500);
             return true;
         }
         catch (NoSuchElementException)
@@ -278,5 +661,88 @@ public sealed class GamAdReviewCenterWorkflow : IGamAdReviewWorkflow
             var element = driver.FindElement(by);
             return element.Displayed ? element : throw new NoSuchElementException("Element chưa visible.");
         };
+
+    private static void WaitForPreviewPanelReady(IWebDriver driver, WebDriverWait wait) =>
+        wait.Until(d =>
+        {
+            if (!string.IsNullOrWhiteSpace(ReadCreativeId(d)))
+                return true;
+
+            try
+            {
+                var panel = d.FindElement(By.XPath(GamReviewSelectors.PreviewPanelRoot));
+                if (panel.Displayed)
+                    return true;
+            }
+            catch (NoSuchElementException)
+            {
+            }
+
+            throw new NoSuchElementException("Preview panel chưa sẵn sàng.");
+        });
+
+    private static IWebElement WaitForAdPreviewScreenshotTarget(IWebDriver driver, WebDriverWait wait) =>
+        wait.Until(d =>
+        {
+            WaitForPreviewIframe(d, TimeSpan.FromSeconds(2));
+            var target = FindVisibleAdPreviewTarget(d);
+            if (target is null)
+                throw new NoSuchElementException("Không tìm thấy vùng preview banner trong preview-panel.");
+
+            return target;
+        });
+
+    private static void WaitForNextCreativePreview(IWebDriver driver, WebDriverWait wait, string previousCreativeId) =>
+        wait.Until(d =>
+        {
+            var id = ReadCreativeId(d);
+            if (string.IsNullOrWhiteSpace(id) || id == previousCreativeId)
+                throw new NoSuchElementException("Chưa chuyển sang creative tiếp theo.");
+
+            return true;
+        });
+
+    private static void WaitForPreviewIframe(IWebDriver driver, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                var iframe = driver.FindElement(By.XPath(GamReviewSelectors.PreviewIframeReady));
+                if (iframe.Displayed)
+                    return;
+            }
+            catch (NoSuchElementException)
+            {
+            }
+            catch (StaleElementReferenceException)
+            {
+            }
+
+            Thread.Sleep(200);
+        }
+    }
+
+    private static IWebElement? FindVisibleAdPreviewTarget(IWebDriver driver)
+    {
+        foreach (var xpath in GamReviewSelectors.AdPreviewScreenshotCandidates)
+        {
+            try
+            {
+                var element = driver.FindElement(By.XPath(xpath));
+                if (element.Displayed && element.Size.Width >= 20 && element.Size.Height >= 20)
+                    return element;
+            }
+            catch (NoSuchElementException)
+            {
+            }
+            catch (StaleElementReferenceException)
+            {
+            }
+        }
+
+        return null;
+    }
 
 }

@@ -17,6 +17,7 @@ public sealed class ReviewBannerUseCase
     private readonly IPromptBuilder _promptBuilder;
     private readonly IBannerVisionAnalyzer _visionAnalyzer;
     private readonly IVerdictParser _verdictParser;
+    private readonly IBannerModerationResultHolder _moderationResultHolder;
     private readonly ITelegramNotifier _telegram;
 
     public ReviewBannerUseCase(
@@ -25,6 +26,7 @@ public sealed class ReviewBannerUseCase
         IPromptBuilder promptBuilder,
         IBannerVisionAnalyzer visionAnalyzer,
         IVerdictParser verdictParser,
+        IBannerModerationResultHolder moderationResultHolder,
         ITelegramNotifier telegram)
     {
         _policyProvider = policyProvider;
@@ -32,20 +34,24 @@ public sealed class ReviewBannerUseCase
         _promptBuilder = promptBuilder;
         _visionAnalyzer = visionAnalyzer;
         _verdictParser = verdictParser;
+        _moderationResultHolder = moderationResultHolder;
         _telegram = telegram;
     }
 
     public async Task<ReviewBannerOutcome> ExecuteAsync(
         string imagePath,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        TimeSpan previewWait = default,
+        TimeSpan screenshotCapture = default)
     {
         var imageRead = TimeSpan.Zero;
         var policyLoad = TimeSpan.Zero;
         var promptBuild = TimeSpan.Zero;
         var llmAnalyze = TimeSpan.Zero;
+        var telegramNotify = TimeSpan.Zero;
 
         ReviewTimingMetrics Timing() =>
-            new(imageRead, policyLoad, promptBuild, llmAnalyze);
+            new(imageRead, policyLoad, promptBuild, llmAnalyze, previewWait, screenshotCapture, telegramNotify);
 
         BannerImage? image;
         var readStopwatch = Stopwatch.StartNew();
@@ -138,6 +144,7 @@ public sealed class ReviewBannerUseCase
 
             llmStopwatch.Stop();
             llmAnalyze = llmStopwatch.Elapsed;
+            var moderation = _moderationResultHolder.ConsumeLastResult();
 
             if (_verdictParser.Parse(rawText, policy) is not BannerVerdictKind verdict)
             {
@@ -149,9 +156,38 @@ public sealed class ReviewBannerUseCase
                 ? policy.BlockedLabel
                 : policy.ReviewedLabel;
 
-            await _telegram.NotifyReviewResultAsync(image.SourcePath, label, Timing(), cancellationToken);
+            var telegramWatch = Stopwatch.StartNew();
+            await _telegram.NotifyReviewResultAsync(
+                image.SourcePath,
+                label,
+                Timing(),
+                moderation,
+                cancellationToken);
+            telegramWatch.Stop();
+            telegramNotify = telegramWatch.Elapsed;
 
-            return new ReviewBannerOutcome.Success(verdict, label);
+            var finalTiming = Timing();
+            Console.WriteLine(
+                $"   ↳ chi tiết: đọc ảnh {imageRead.TotalMilliseconds}ms | policy {policyLoad.TotalMilliseconds}ms | " +
+                $"Florence {llmAnalyze.TotalSeconds:F1}s | Telegram {telegramNotify.TotalMilliseconds}ms");
+            Console.WriteLine(
+                $"⏱ [Tổng] Banner mới → Telegram xong: {finalTiming.TotalFromBannerAppearToTelegram.TotalSeconds:F1}s");
+
+            if (moderation is not null)
+            {
+                if (!string.IsNullOrWhiteSpace(moderation.Reason))
+                    Console.WriteLine($"   ↳ Florence: {moderation.Reason}");
+
+                if (moderation.GeminiAttempted)
+                {
+                    if (moderation.FinalSource == ModerationFinalSource.Gemini)
+                        Console.WriteLine($"   ↳ Gemini: {moderation.GeminiVerdict}");
+                    else if (!string.IsNullOrWhiteSpace(moderation.GeminiError))
+                        Console.WriteLine($"   ↳ Gemini fallback ({moderation.FinalSource}): {moderation.GeminiError}");
+                }
+            }
+
+            return new ReviewBannerOutcome.Success(verdict, label, moderation, finalTiming);
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("API key", StringComparison.OrdinalIgnoreCase))
         {
