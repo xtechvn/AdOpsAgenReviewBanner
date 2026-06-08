@@ -1,4 +1,4 @@
-// =============================================================================
+﻿// =============================================================================
 // FILE CHÍNH (ENTRY POINT) — Ứng dụng bắt đầu từ đây khi chạy / debug.
 //
 // Luồng tổng quát:
@@ -139,6 +139,11 @@ try
         }
 
         Console.WriteLine($"TEST startup: quét folder → {defaultImageFolder}");
+        Console.WriteLine(
+            "Không mở Chrome. Để test GAM + Selenium: đặt Runtime:TestStartupMode=GamReview + DefaultGamReviewUrl, " +
+            "hoặc chạy: dotnet run -- \"https://admanager.google.com/...\"");
+        Console.WriteLine(
+            "Cấu hình Chrome: Selenium:Headless=false và Selenium:UserDataDirs (profile đã login GAM).");
         return await batchRunner.ExecuteFolderAsync(defaultImageFolder);
     }
 
